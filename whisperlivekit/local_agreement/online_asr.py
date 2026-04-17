@@ -182,6 +182,10 @@ class OnlineASRProcessor:
             if gap_samples > 0:
                 gap_silence = np.zeros(gap_samples, dtype=np.float32)
                 self.insert_audio_chunk(gap_silence)
+            # Clear stale hypothesis so first tokens of new speech are
+            # committed directly, not compared against previous utterance.
+            # start_silence() already committed anything worth keeping.
+            self.transcript_buffer.buffer = []
         else:
             self.init(offset=silence_duration + offset)
 
