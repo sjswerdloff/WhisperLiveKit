@@ -8,6 +8,7 @@ from whisperlivekit.timed_objects import ASRToken, Sentence, Transcript
 
 logger = logging.getLogger(__name__)
 
+
 class HypothesisBuffer:
     """
     Buffer to store and process ASR hypothesis tokens.
@@ -17,6 +18,7 @@ class HypothesisBuffer:
       - buffer: the last hypothesis that is not yet committed
       - new: new tokens coming from the recognizer
     """
+
     def __init__(self, logfile=sys.stderr, confidence_validation=False):
         self.confidence_validation = confidence_validation
         self.committed_in_buffer: List[ASRToken] = []
@@ -71,7 +73,12 @@ class HypothesisBuffer:
                 self.new.pop(0)
                 self.buffer.pop(0) if self.buffer else None
             elif not self.buffer:
-                break
+                # First window after silence/reset: commit tokens directly
+                # instead of dropping them (nothing to compare against)
+                committed.append(current_new)
+                self.last_committed_word = current_new.text
+                self.last_committed_time = current_new.end
+                self.new.pop(0)
             elif current_new.text == self.buffer[0].text:
                 committed.append(current_new)
                 self.last_committed_word = current_new.text
@@ -93,7 +100,6 @@ class HypothesisBuffer:
             self.committed_in_buffer.pop(0)
 
 
-
 class OnlineASRProcessor:
     """
     Processes incoming audio in a streaming fashion, calling the ASR system
@@ -103,6 +109,7 @@ class OnlineASRProcessor:
       - "sentence": trims at sentence boundaries (using a sentence tokenizer)
       - "segment": trims at fixed segment durations.
     """
+
     SAMPLING_RATE = 16000
 
     def __init__(
@@ -144,7 +151,9 @@ class OnlineASRProcessor:
     def init(self, offset: Optional[float] = None):
         """Initialize or reset the processing buffers."""
         self.audio_buffer = np.array([], dtype=np.float32)
-        self.transcript_buffer = HypothesisBuffer(logfile=self.logfile, confidence_validation=self.confidence_validation)
+        self.transcript_buffer = HypothesisBuffer(
+            logfile=self.logfile, confidence_validation=self.confidence_validation
+        )
         self.buffer_time_offset = offset if offset is not None else 0.0
         self.transcript_buffer.last_committed_time = self.buffer_time_offset
         self.committed: List[ASRToken] = []
@@ -173,6 +182,10 @@ class OnlineASRProcessor:
             if gap_samples > 0:
                 gap_silence = np.zeros(gap_samples, dtype=np.float32)
                 self.insert_audio_chunk(gap_silence)
+            # Clear stale hypothesis so first tokens of new speech are
+            # committed directly, not compared against previous utterance.
+            # start_silence() already committed anything worth keeping.
+            self.transcript_buffer.buffer = []
         else:
             self.init(offset=silence_duration + offset)
 
@@ -214,7 +227,6 @@ class OnlineASRProcessor:
         """
         return self.concatenate_tokens(self.transcript_buffer.buffer)
 
-
     def process_iter(self) -> Tuple[List[ASRToken], float]:
         """
         Processes the current audio buffer.
@@ -224,7 +236,7 @@ class OnlineASRProcessor:
         current_audio_processed_upto = self.get_audio_buffer_end_time()
         prompt_text, _ = self.prompt()
         logger.debug(
-            f"Transcribing {len(self.audio_buffer)/self.SAMPLING_RATE:.2f} seconds from {self.buffer_time_offset:.2f}"
+            f"Transcribing {len(self.audio_buffer) / self.SAMPLING_RATE:.2f} seconds from {self.buffer_time_offset:.2f}"
         )
         res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt_text)
         tokens = self.asr.ts_words(res)
@@ -245,8 +257,7 @@ class OnlineASRProcessor:
             time_since_last_output = self.get_audio_buffer_end_time() - self.time_of_last_asr_output
             if time_since_last_output > self.buffer_trimming_sec:
                 logger.warning(
-                    f"No ASR output for {time_since_last_output:.2f}s. "
-                    f"Resetting buffer to prevent freezing."
+                    f"No ASR output for {time_since_last_output:.2f}s. Resetting buffer to prevent freezing."
                 )
                 self.init(offset=self.get_audio_buffer_end_time())
                 return [], current_audio_processed_upto
@@ -259,9 +270,7 @@ class OnlineASRProcessor:
         if len(self.audio_buffer) / self.SAMPLING_RATE > s:
             self.chunk_completed_segment(res)
             logger.debug("Chunking segment")
-        logger.debug(
-            f"Length of audio buffer now: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f} seconds"
-        )
+        logger.debug(f"Length of audio buffer now: {len(self.audio_buffer) / self.SAMPLING_RATE:.2f} seconds")
         return committed_tokens, current_audio_processed_upto
 
     def chunk_completed_sentence(self):
@@ -340,16 +349,12 @@ class OnlineASRProcessor:
         Trim both the hypothesis and audio buffer at the given time.
         """
         logger.debug(f"Chunking at {time:.2f}s")
-        logger.debug(
-            f"Audio buffer length before chunking: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f}s"
-        )
+        logger.debug(f"Audio buffer length before chunking: {len(self.audio_buffer) / self.SAMPLING_RATE:.2f}s")
         self.transcript_buffer.pop_committed(time)
         cut_seconds = time - self.buffer_time_offset
-        self.audio_buffer = self.audio_buffer[int(cut_seconds * self.SAMPLING_RATE):]
+        self.audio_buffer = self.audio_buffer[int(cut_seconds * self.SAMPLING_RATE) :]
         self.buffer_time_offset = time
-        logger.debug(
-            f"Audio buffer length after chunking: {len(self.audio_buffer)/self.SAMPLING_RATE:.2f}s"
-        )
+        logger.debug(f"Audio buffer length after chunking: {len(self.audio_buffer) / self.SAMPLING_RATE:.2f}s")
 
     def words_to_sentences(self, tokens: List[ASRToken]) -> List[Sentence]:
         """
@@ -407,12 +412,7 @@ class OnlineASRProcessor:
         self.buffer_time_offset = final_processed_upto
         return remaining_tokens, final_processed_upto
 
-    def concatenate_tokens(
-        self,
-        tokens: List[ASRToken],
-        sep: Optional[str] = None,
-        offset: float = 0
-    ) -> Transcript:
+    def concatenate_tokens(self, tokens: List[ASRToken], sep: Optional[str] = None, offset: float = 0) -> Transcript:
         sep = sep if sep is not None else self.asr.sep
         text = sep.join(token.text for token in tokens)
         # probability = sum(token.probability for token in tokens if token.probability) / len(tokens) if tokens else None
