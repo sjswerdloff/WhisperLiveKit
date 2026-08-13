@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from whisperlivekit.backend_support import faster_backend_available, mlx_backend_available
+from whisperlivekit.thread_safety import LOCK_TIMEOUT, ModelLockContext
 from whisperlivekit.whisper.audio import N_FRAMES, N_SAMPLES, TOKENS_PER_SECOND, log_mel_spectrogram, pad_or_trim
 from whisperlivekit.whisper.decoding import BeamSearchDecoder, GreedyDecoder, SuppressTokens
 from whisperlivekit.whisper.timing import median_filter
@@ -21,8 +22,45 @@ from .token_buffer import TokenBuffer
 logger = logging.getLogger(__name__)
 
 if mlx_backend_available():
+    import mlx.core as mx
     from mlx_whisper.audio import log_mel_spectrogram as mlx_log_mel_spectrogram
     from mlx_whisper.transcribe import pad_or_trim as mlx_pad_or_trim
+
+
+def mlx_encode_serialized(mlx_encoder, mel):
+    """Run one MLX encoder forward pass, serialized against every other caller.
+
+    The encoder is a SINGLE instance shared by every session: TranscriptionEngine is
+    a singleton (core.py) and hands the same ``self.mlx_encoder`` to each session's
+    AlignAtt (backend.py). Transcription runs on asyncio's default thread pool
+    (``await asyncio.to_thread(self.transcription.process_iter)``), so two live
+    sessions means two threads in here at once.
+
+    MLX allocates one Metal command encoder per stream, and nothing on this path
+    asks for a stream other than the default, so a concurrent pair aborts the
+    process:
+
+        tryCoalescingPreviousComputeCommandEncoderWithConfig:1094:
+        failed assertion `A command encoder is already encoding to this command buffer'
+
+    That is abort(), not an exception. One racing pair kills EVERY session on the
+    server, not just the two involved.
+
+    ``mx.eval`` must stay INSIDE the lock. MLX is lazy, so returning an unevaluated
+    array would release the lock before any Metal work had been submitted and would
+    serialize nothing while looking exactly like a fix.
+    """
+    with ModelLockContext() as acquired:
+        if not acquired:
+            # Fail closed. Proceeding unserialized risks abort(), which takes down
+            # every other session; raising costs only this one.
+            raise RuntimeError(
+                f"Timed out acquiring the model lock after {LOCK_TIMEOUT}s; "
+                "refusing to run the MLX encoder unserialized."
+            )
+        feature = mlx_encoder.encoder(mel)
+        mx.eval(feature)
+        return feature
 
 if faster_backend_available():
     from faster_whisper.audio import pad_or_trim as fw_pad_or_trim
@@ -261,7 +299,7 @@ class AlignAtt(AlignAttBase):
                 n_mels=self.model.dims.n_mels, padding=N_SAMPLES,
             )
             mlx_mel = mlx_pad_or_trim(mlx_mel_padded, N_FRAMES, axis=-2)
-            mlx_encoder_feature = self.mlx_encoder.encoder(mlx_mel[None])
+            mlx_encoder_feature = mlx_encode_serialized(self.mlx_encoder, mlx_mel[None])
             encoder_feature = torch.as_tensor(mlx_encoder_feature)
             content_mel_len = int((mlx_mel_padded.shape[0] - mlx_mel.shape[0]) / 2)
         elif self.fw_encoder:
